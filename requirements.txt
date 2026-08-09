@@ -1,0 +1,2 @@
+# Nothing to install. The project uses the Python standard library only,
+# and sqlite3 is part of it. Python 3.8 or newer is enough.
