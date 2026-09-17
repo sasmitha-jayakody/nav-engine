@@ -1,9 +1,12 @@
 # NAV calculation engine
 
-A working fund accounting system, scaled down. It keeps a EUR denominated fund
-with two share classes in a SQLite database, strikes a NAV per share every
-business day from prices, FX rates, fees and corporate actions, then runs a
-separate oversight pass that produces a daily exceptions report.
+A working fund accounting system, scaled down. It keeps a EUR denominated
+hybrid fund in a SQLite database: two open-ended, hedge/mutual-fund-style
+share classes struck at a daily NAV, and a PE-style share class dealt via
+capital calls and distributions with carried interest paid through a
+waterfall. It strikes a NAV per share every business day from prices, FX
+rates, fees and corporate actions, then runs a separate oversight pass that
+produces a daily exceptions report.
 
 The data is synthetic and the repo generates it, so a fresh clone runs end to
 end with one command. Five errors are planted in that data on purpose. Finding
@@ -31,7 +34,13 @@ allowing for the day's subscriptions and redemptions. Then somebody independent
 has to check the answer before it goes out. A NAV that is wrong is a reportable
 error. So is a NAV that happens to be right but was never checked.
 
-This repo models that daily cycle for a EUR fund with two share classes.
+This repo models that daily cycle for a EUR fund with three share classes:
+two open-ended (EUR Acc, USD Dist) and one PE-style (PE Sleeve). A hybrid
+fund of this kind -- one vehicle holding both a daily-priced liquid book and
+an illiquid, periodically-marked one -- is increasingly how the market
+actually structures things, and it needs different plumbing for how investors
+deal and how the manager gets paid. See "Hybrid fund: the PE Sleeve and its
+waterfall" below.
 
 ## Data model
 
@@ -102,6 +111,12 @@ erDiagram
 `transactions` and `fee_accruals` are left out of the picture to keep it
 readable. They follow the same pattern.
 
+The PE Sleeve's own tables (`capital_commitments`, `waterfall_config`,
+`pe_sleeve_marks`, `capital_calls`, `distributions`, `waterfall_ledger`) live
+in `sql/04_hybrid_waterfall.sql`, kept separate from the base schema above --
+see "Hybrid fund: the PE Sleeve and its waterfall" below for what they do and
+why they're additive rather than folded into this diagram.
+
 ## How the NAV is struck
 
 Valuation runs in SQL, in `sql/02_nav_calculation.sql`. It is a set operation:
@@ -131,6 +146,83 @@ Things left out on purpose: the fund is fully invested at inception and never
 trades again, there is one pricing point a day, and there is no income
 equalisation and no tax. Steps 1 to 6 could be pushed into pure SQL with a
 recursive CTE.
+
+## Hybrid fund: the PE Sleeve and its waterfall
+
+The two classes above are hedge/mutual-fund style: investors deal at a daily
+struck NAV, and the manager charges a flat management fee. A PE-style vehicle
+is structured differently on both counts, and this repo's third class (PE
+Sleeve, `share_class_id = 3`) models it end to end:
+
+* **Dealing.** Investors don't subscribe and redeem freely. They **commit**
+  capital up front (`capital_commitments`), the manager draws it down over
+  time via **capital calls** (`capital_calls`) as opportunities come up, and
+  investors get cash back via **distributions** (`distributions`) as
+  investments realize. A class only deals this way if it has a row in
+  `waterfall_config` -- that row is what marks it as PE-style at all, nothing
+  in `share_classes` itself changes.
+
+* **Valuation.** The illiquid sleeve is marked by the manager periodically
+  (`pe_sleeve_marks`, roughly weekly here), not priced daily like the equity
+  book. It also does **not** participate in `v_fund_gav`. Folding capital-call
+  cash straight into the shared GAV would make every class's day-over-day
+  return jump on call days for reasons that have nothing to do with markets --
+  the same problem performance measurement solves with Modified Dietz /
+  time-weighted returns. Keeping the two sleeves' valuation separate sidesteps
+  that without needing a full cash-flow-adjusted return calculation here.
+
+* **Incentive fee.** Instead of a hedge-fund-style performance fee (X% of NAV
+  appreciation above a high-water mark), carried interest is paid through a
+  **waterfall**: every dollar that could move between LPs and the GP is tiered,
+  in order --
+
+  1. `RETURN_OF_CAPITAL` -- LPs get called capital back first, 100% to LP
+  2. `PREFERRED_RETURN` -- LPs then earn a hurdle (8% here, compounded
+     actual/365) on that capital, 100% to LP
+  3. `GP_CATCHUP` -- the GP "catches up" until its cumulative share of
+     (preferred return + catch-up) hits the carry percentage
+  4. `CARRY_SPLIT` -- everything after that splits 80/20 between LP and GP,
+     uncapped
+
+  This lives in `src/waterfall.py`, independent of the database, and supports
+  both textbook pooling modes: **EUROPEAN** (whole-fund -- every call and
+  distribution across the fund's life shares one pool of tiers, so the GP
+  can't reach carry until *all* called capital plus its preferred return has
+  come back, fund-wide) and **AMERICAN** (deal-by-deal -- each investment gets
+  its own tier stack via a `deal_id` tag, so a profitable early deal can pay
+  the GP carry while a later one is still underwater). The PE Sleeve here runs
+  EUROPEAN, the LP-friendlier and currently more common choice; the repo's
+  tests exercise AMERICAN too, including `waterfall.clawback()`, which is the
+  actual reason American waterfalls carry a clawback clause -- a GP that gets
+  paid ahead of where a whole-fund view would put it can end up owing the
+  difference back.
+
+  `calculate_nav.py`'s `run_pe_sleeve()` re-runs the *entire* cashflow history
+  through the waterfall every NAV date, with today's post-fee sleeve value fed
+  in as an unrealized "what if we liquidated today" top-up. The day-over-day
+  change in the GP's cumulative entitlement is that day's carry accrual --
+  the same mark-to-market idea a hedge fund's accrued (uncrystallized)
+  performance fee uses, just running PE tier math instead of a simple hurdle
+  percentage. `waterfall_ledger` keeps every tier from every day as an audit
+  trail; only the rows tagged `synthetic = 0` (a real cashflow, not a mark-to-
+  market snapshot) are safe to sum across dates, since each mark-to-market row
+  is a full as-of-today snapshot, not a delta.
+
+  `reconciliation.py`'s `shadow_pe_nav()` re-implements this same roll forward
+  independently, the way `shadow_nav()` already does for the open-ended
+  classes, and checks it against calculate_nav.py's output via the same
+  `NAV_CALC_BREAK` check -- there are zero breaks for the PE Sleeve on this
+  dataset, which is the point of having a shadow calculation at all.
+
+Things left out on purpose here too: multiple GPs or co-investors, tax
+distributions and gross-ups, management-fee offsets against carry, and a
+deal ledger separate from the capital-call ledger (the American mode uses a
+capital call as its unit of "deal" since there is no other investment-level
+ledger to key off of in this scaled-down model). See the module docstring in
+`src/waterfall.py` for the tier math in full, and `tests/test_waterfall.py`
+for the worked examples (return of capital only, exact hurdle, full catch-up
+and carry, multiple calls, mark-to-market accrual, and the American-vs-
+European clawback scenario).
 
 ## The exceptions layer
 
@@ -198,6 +290,13 @@ python run.py
 That builds the database, strikes the NAV and prints the exceptions report. On
 Windows, use `py run.py` if `python` is not on your path.
 
+```bash
+python -m unittest discover tests -v
+```
+
+Runs the waterfall tier-math unit tests and an end-to-end check of the PE
+Sleeve wired into a real (throwaway) database. Neither touches `data/nav.db`.
+
 To dig into the data, open `data/nav.db` in
 [DB Browser for SQLite](https://sqlitebrowser.org) and work through
 `sql/03_sample_queries.sql` from the top. Those queries start at a plain SELECT
@@ -209,16 +308,21 @@ and end at window functions, following the same path the engine takes.
 nav-engine/
 ├── README.md
 ├── requirements.txt
-├── run.py                      # one command: generate, strike NAV, reconcile
+├── run.py                       # one command: generate, strike NAV, reconcile
 ├── sql/
-│   ├── 01_schema.sql           # tables, keys, foreign keys
-│   ├── 02_nav_calculation.sql  # valuation views (JOIN, GROUP BY, window fns)
-│   └── 03_sample_queries.sql   # guided SQL tour, easy to advanced
+│   ├── 01_schema.sql            # tables, keys, foreign keys
+│   ├── 02_nav_calculation.sql   # valuation views (JOIN, GROUP BY, window fns)
+│   ├── 03_sample_queries.sql    # guided SQL tour, easy to advanced
+│   └── 04_hybrid_waterfall.sql  # PE-style dealing + waterfall schema, additive
 ├── src/
-│   ├── generate_data.py        # synthetic data and the planted errors
-│   ├── calculate_nav.py        # per class daily NAV roll forward
-│   └── reconciliation.py       # the exceptions layer
-└── data/                       # nav.db is written here and git-ignored
+│   ├── generate_data.py         # synthetic data and the planted errors
+│   ├── calculate_nav.py         # per class daily NAV roll forward (open-ended + PE sleeve)
+│   ├── reconciliation.py        # the exceptions layer
+│   └── waterfall.py             # PE incentive fee waterfall (ROC/pref/catch-up/carry)
+├── tests/
+│   ├── test_waterfall.py               # tier math, unit tested in isolation
+│   └── test_pe_sleeve_integration.py   # PE sleeve wired to a real (throwaway) database
+└── data/                        # nav.db is written here and git-ignored
 ```
 
 ## What is missing for production
@@ -227,6 +331,11 @@ Decimal or fixed point money instead of floats, so rounding cannot move the NAV.
 More than one price source, with a hierarchy for choosing between them. Income
 equalisation, tax and withholding. Swing pricing. A server database with an audit
 trail and four eyes sign off before a NAV is published. A scheduler.
+
+For the PE Sleeve specifically: multiple GPs or co-investors, tax distributions
+and gross-ups, management-fee offsets against carry, a deal ledger independent
+of the capital-call ledger, and LPA-specific hurdle/catch-up variations (this
+repo's 100%-catch-up formula is the common case, not the only one).
 
 All of that is real work. None of it changes the accounting in the middle, which
 is the part this repo is about.
