@@ -11,6 +11,7 @@ Six checks, each one modelled on a control a fund oversight team actually runs:
   4. PRICE_OUTLIER          a one-day move past a hard threshold
   5. NAV_MOVE_TOLERANCE     fund GAV moving more than tolerance day over day
   6. NAV_CALC_BREAK         stored NAV disagrees with an independent recompute
+  7. PE_SLEEVE_BREAK        PE sleeve NAV that does not tie out, or calls over commitment
 
 Findings go into the `exceptions` table and get printed as a report.
 
@@ -24,8 +25,10 @@ from datetime import date
 
 try:
     from src import waterfall
+    from src.pe_sleeve import sleeve_cashflows
 except ImportError:
     import waterfall
+    from pe_sleeve import sleeve_cashflows
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -133,9 +136,8 @@ def shadow_nav(con):
     production output (planted error 5) would sail through unnoticed.
     """
     gav = query(con, "SELECT val_date, gross_asset_value_eur FROM v_fund_gav ORDER BY val_date")
-    classes = [c for c in query(con, "SELECT share_class_id, currency, mgmt_fee_bps FROM share_classes "
-                                     "ORDER BY share_class_id")
-               if c["share_class_id"] in CLASS_SPLIT]  # PE-style classes have their own shadow_pe_nav()
+    classes = query(con, "SELECT share_class_id, currency, mgmt_fee_bps FROM share_classes "
+                         "ORDER BY share_class_id")
     flows = query(con, "SELECT flow_date, share_class_id, flow_type, shares "
                        "FROM subscriptions_redemptions")
     fx = {}
@@ -183,83 +185,11 @@ def shadow_nav(con):
     return recomputed
 
 
-def shadow_pe_nav(con):
-    """Independent re-implementation of run_pe_sleeve()'s roll forward, for
-    every share class with a waterfall_config row. Written separately from
-    calculate_nav.py's loop, the same way shadow_nav() is for the open-ended
-    classes -- both call into src/waterfall.py, which is trusted, tested
-    infrastructure the same way the v_fund_gav SQL view is; the point of a
-    shadow calc is to catch a booking mistake in the day-by-day roll forward,
-    not to re-derive the tier math from scratch a second time.
-    """
-    configs = query(con, "SELECT share_class_id, waterfall_type, hurdle_rate_annual, "
-                         "catchup_gp_share, carry_pct FROM waterfall_config")
-    if not configs:
-        return {}
-
-    bps_by_class = {c["share_class_id"]: c["mgmt_fee_bps"] for c in
-                    query(con, "SELECT share_class_id, mgmt_fee_bps FROM share_classes")}
-    calls = query(con, "SELECT call_date, share_class_id, amount_eur FROM capital_calls ORDER BY call_date")
-    dists = query(con, "SELECT dist_date, share_class_id, deal_id, amount_eur "
-                       "FROM distributions ORDER BY dist_date")
-    marks = query(con, "SELECT mark_date, share_class_id, sleeve_value_eur FROM pe_sleeve_marks")
-    nav_dates = [r["val_date"] for r in
-                 query(con, "SELECT DISTINCT val_date FROM v_fund_gav ORDER BY val_date")][1:]
-
-    recomputed = {}
-    for cfg in configs:
-        cid = cfg["share_class_id"]
-        bps = bps_by_class[cid]
-        cls_calls = [c for c in calls if c["share_class_id"] == cid]
-        cls_dists = [d for d in dists if d["share_class_id"] == cid]
-        marks_by_date = {m["mark_date"]: m["sleeve_value_eur"] for m in marks if m["share_class_id"] == cid}
-        calls_by_date = {}
-        for c in cls_calls:
-            calls_by_date[c["call_date"]] = calls_by_date.get(c["call_date"], 0.0) + c["amount_eur"]
-        dists_by_date = {}
-        for d in cls_dists:
-            dists_by_date.setdefault(d["dist_date"], []).append(d)
-
-        gross = accrued_fee = accrued_carry = na = sh = 0.0
-        for d in nav_dates:
-            if d in marks_by_date:
-                gross = marks_by_date[d]
-            fee = gross * (bps / 10000.0) / 365.0
-            accrued_fee += fee
-            distributable = gross - accrued_fee
-
-            call_amt = calls_by_date.get(d, 0.0)
-            today_dists = dists_by_date.get(d, [])
-            dist_amt = sum(x["amount_eur"] for x in today_dists)
-
-            cf = [(c["call_date"], "CALL", c["amount_eur"]) for c in cls_calls if c["call_date"] < d]
-            cf += [(x["dist_date"], "DIST", x["amount_eur"], x["deal_id"] or waterfall.DEFAULT_DEAL)
-                   for x in cls_dists if x["dist_date"] <= d]
-
-            result = waterfall.run_waterfall(cf, cfg["hurdle_rate_annual"], cfg["catchup_gp_share"],
-                                              cfg["carry_pct"], mode=cfg["waterfall_type"],
-                                              as_of_date=d, unrealized_value=max(distributable - dist_amt, 0.0))
-            accrued_carry = result.gp_total()
-
-            na_before = distributable - accrued_carry
-            nav_eur = na_before / sh if sh > 0 else 100.0
-
-            lp_amt = 0.0
-            if today_dists:
-                lp_amt, _ = result.event_split(d)
-            na = na_before + call_amt - lp_amt
-            sh = sh + (call_amt / nav_eur if call_amt else 0.0) - (lp_amt / nav_eur if lp_amt else 0.0)
-            gross = gross + call_amt - lp_amt
-            recomputed[(d, cid)] = nav_eur
-    return recomputed
-
-
 def check_nav_break(con):
     stored = query(con, "SELECT nav_date, share_class_id, nav_per_share_eur FROM nav_daily")
     names = {r["share_class_id"]: r["class_name"] for r in
              query(con, "SELECT share_class_id, class_name FROM share_classes")}
     recomputed = shadow_nav(con)
-    recomputed.update(shadow_pe_nav(con))
     out = []
     for r in stored:
         exp = recomputed.get((r["nav_date"], r["share_class_id"]))
@@ -271,6 +201,59 @@ def check_nav_break(con):
     return out
 
 
+def check_pe_sleeve(con):
+    """Ties out the PE sleeve NAV without replaying its roll forward.
+
+    For every quarter end:
+      * units x NAV per unit has to equal net assets
+      * net assets has to equal mark, less fee, less carry accrued but unpaid,
+        plus the day's calls, less the day's gross distributions
+      * carry accrued has to match a fresh waterfall run on the raw calls,
+        distributions and mark
+    And across the life of the sleeve, calls cannot exceed the commitment.
+    """
+    out = []
+    for sl in query(con, "SELECT * FROM pe_sleeve"):
+        sid, name = sl["sleeve_id"], sl["sleeve_name"]
+        calls = query(con, "SELECT call_date, deal_id, amount_eur FROM pe_capital_calls "
+                           "WHERE sleeve_id = ?", (sid,))
+        dists = query(con, "SELECT dist_date, deal_id, amount_eur FROM pe_distributions "
+                           "WHERE sleeve_id = ?", (sid,))
+
+        called = sum(c["amount_eur"] for c in calls)
+        if called > sl["committed_eur"] + NAV_BREAK_EUR:
+            out.append(("PE_SLEEVE_BREAK", "HIGH", name,
+                        f"calls of {called:,.0f} EUR exceed the {sl['committed_eur']:,.0f} EUR commitment"))
+
+        for r in query(con, "SELECT * FROM pe_sleeve_nav WHERE sleeve_id = ? ORDER BY nav_date", (sid,)):
+            d = r["nav_date"]
+            call_today = sum(c["amount_eur"] for c in calls if c["call_date"] == d)
+            cash_out = sum(x["amount_eur"] for x in dists if x["dist_date"] == d)
+
+            if abs(r["units_outstanding"] * r["nav_per_unit_eur"] - r["net_assets_eur"]) > 1.0:
+                out.append(("PE_SLEEVE_BREAK", "HIGH", name,
+                            f"units x NAV does not equal net assets on {d}"))
+
+            expected = (r["gross_value_eur"] - r["mgmt_fee_eur"]
+                        - (r["carry_accrued_eur"] - r["carry_paid_eur"])
+                        + call_today - cash_out)
+            if abs(expected - r["net_assets_eur"]) > 1.0:
+                out.append(("PE_SLEEVE_BREAK", "HIGH", name,
+                            f"net assets {r['net_assets_eur']:,.2f} on {d} vs {expected:,.2f} "
+                            f"from mark, fee, carry and cash"))
+
+            carry = waterfall.run_waterfall(
+                sleeve_cashflows(calls, dists, d), sl["hurdle_rate"], sl["catchup_gp_share"],
+                sl["carry_pct"], mode=sl["waterfall_type"], as_of_date=d,
+                unrealized_value=max(r["gross_value_eur"] - r["mgmt_fee_eur"] - cash_out, 0.0),
+            ).gp_total()
+            if abs(carry - r["carry_accrued_eur"]) > 1.0:
+                out.append(("PE_SLEEVE_BREAK", "HIGH", name,
+                            f"carry accrued {r['carry_accrued_eur']:,.2f} on {d} vs "
+                            f"{carry:,.2f} from a fresh waterfall run"))
+    return out
+
+
 def run():
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA foreign_keys = ON;")
@@ -278,7 +261,7 @@ def run():
 
     findings = []
     for fn in (check_stale_prices, check_missing_prices, check_price_moves,
-               check_nav_moves, check_nav_break):
+               check_nav_moves, check_nav_break, check_pe_sleeve):
         findings += fn(con)
 
     run_date = date.today().isoformat()
