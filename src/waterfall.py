@@ -71,6 +71,9 @@ class _Tiers:
     """One set of tiers with running balances, fed one cashflow at a time."""
 
     def __init__(self, hurdle, catchup_gp_share, carry_pct):
+        if 0 < catchup_gp_share <= carry_pct:
+            raise ValueError("catch-up share has to be above the carry percentage, "
+                             "or the GP can never catch up")
         self.hurdle = hurdle
         self.catchup_gp_share = catchup_gp_share
         self.carry_pct = carry_pct
@@ -112,11 +115,11 @@ class _Tiers:
         left -= pref
         pay(PREF, "LP", pref)
 
-        # Size the catch-up slice so the GP ends it holding carry_pct of
-        # (pref paid + GP catch-up). With 100% catch-up that is
-        # pref * carry / (1 - carry).
-        if left > 0 and self.catchup_gp_share > 0 and self.carry_pct < 1:
-            target = self.carry_pct * self.pref_paid / (1 - self.carry_pct) / self.catchup_gp_share
+        # Size the catch-up slice S so the GP ends it holding carry_pct of all
+        # profit paid so far: share * S = carry * (pref + S), which gives
+        # S = carry * pref / (share - carry).
+        if left > 0 and self.catchup_gp_share > 0:
+            target = self.carry_pct * self.pref_paid / (self.catchup_gp_share - self.carry_pct)
             slice_ = min(left, max(0.0, target - self.catchup_paid))
             self.catchup_paid += slice_
             left -= slice_

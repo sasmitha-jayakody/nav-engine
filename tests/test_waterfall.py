@@ -56,6 +56,18 @@ class CatchUpAndCarry(unittest.TestCase):
         self.assertGreater(r.total(CATCHUP, "LP"), 0.0)
         self.assertAlmostEqual(r.gp_total() + r.lp_total(), 1000.0)
 
+    def test_half_catch_up_still_reaches_20pct_when_the_slice_ends(self):
+        # Pay out exactly capital + pref + the catch-up slice, nothing more.
+        pref = tier([("2024-01-01", "CALL", 100.0), ("2025-01-01", "DIST", 1000.0)]).total(PREF)
+        paid = 100.0 + pref + CARRY_PCT * pref / (0.5 - CARRY_PCT)
+        r = tier([("2024-01-01", "CALL", 100.0), ("2025-01-01", "DIST", paid)], catchup=0.5)
+        self.assertAlmostEqual(r.total(CARRY), 0.0)
+        self.assertAlmostEqual(r.gp_total() / (paid - 100.0), CARRY_PCT)
+
+    def test_catch_up_share_at_or_below_carry_is_rejected(self):
+        with self.assertRaises(ValueError):
+            tier([("2024-01-01", "CALL", 100.0), ("2025-01-01", "DIST", 200.0)], catchup=0.2)
+
 
 class HypotheticalLiquidation(unittest.TestCase):
     def test_unrealized_value_accrues_carry_without_a_real_distribution(self):
