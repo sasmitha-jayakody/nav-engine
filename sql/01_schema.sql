@@ -111,8 +111,9 @@ CREATE TABLE subscriptions_redemptions (
 CREATE TABLE fee_accruals (
     accrual_date    TEXT    NOT NULL,
     share_class_id  INTEGER NOT NULL,
-    fee_amount      REAL    NOT NULL,     -- daily management fee accrued (EUR)
-    PRIMARY KEY (accrual_date, share_class_id),
+    fee_amount      REAL    NOT NULL,     -- daily fee/carry accrued (EUR), reduces NAV
+    fee_type        TEXT    NOT NULL DEFAULT 'MGMT',  -- 'MGMT' | 'INCENTIVE' (waterfall carry, PE-style classes)
+    PRIMARY KEY (accrual_date, share_class_id, fee_type),
     FOREIGN KEY (share_class_id) REFERENCES share_classes(share_class_id)
 );
 

@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DB_PATH = os.path.join(ROOT, "data", "nav.db")
 SCHEMA_PATH = os.path.join(ROOT, "sql", "01_schema.sql")
+HYBRID_SCHEMA_PATH = os.path.join(ROOT, "sql", "04_hybrid_waterfall.sql")
 
 BASE_CCY = "EUR"
 
@@ -62,10 +63,69 @@ SECURITIES = [
 ]
 
 SHARE_CLASSES = [
-    # id, name,       ccy,   policy, mgmt_fee_bps, inception
-    (1, "EUR Acc",  "EUR", "ACC",  75,  INCEPTION),   # institutional-ish
-    (2, "USD Dist", "USD", "DIST", 150, INCEPTION),   # retail, higher fee
+    # id, name,        ccy,   policy, mgmt_fee_bps, inception
+    (1, "EUR Acc",   "EUR", "ACC",  75,  INCEPTION),   # institutional-ish
+    (2, "USD Dist",  "USD", "DIST", 150, INCEPTION),   # retail, higher fee
+    (3, "PE Sleeve", "EUR", "ACC",  175, INCEPTION),   # hybrid: PE-style dealing + waterfall carry
 ]
+
+# ---------------------------------------------------------------------------
+# Hybrid fund: PE Sleeve (share class 3) deals via capital calls and
+# distributions instead of subs/reds, and its incentive fee is carried
+# interest via a waterfall instead of a flat performance fee. It does NOT
+# participate in v_fund_gav / CLASS_SPLIT at all -- see sql/04_hybrid_waterfall.sql
+# for why the illiquid sleeve is kept out of the shared, daily-priced GAV.
+# ---------------------------------------------------------------------------
+PE_SHARE_CLASS_ID = 3
+
+CAPITAL_COMMITMENTS = [
+    # share_class_id, committed_capital_eur
+    (PE_SHARE_CLASS_ID, 5_000_000.0),   # only part of this ever gets called
+]
+
+WATERFALL_CONFIG = [
+    # share_class_id, waterfall_type, hurdle_rate_annual, catchup_gp_share, carry_pct
+    (PE_SHARE_CLASS_ID, "EUROPEAN", 0.08, 1.0, 0.20),  # 8% pref, 100% GP catch-up, 20% carry
+]
+
+
+def gen_pe_calls():
+    return [
+        # call_id, call_date,   share_class_id,     amount_eur
+        (1, "2024-01-09", PE_SHARE_CLASS_ID, 2_000_000.0),
+        (2, "2024-01-22", PE_SHARE_CLASS_ID, 1_000_000.0),
+    ]  # 2,000,000 of the 5,000,000 commitment is left undrawn
+
+
+def gen_pe_distributions():
+    return [
+        # dist_id, dist_date,   share_class_id,     deal_id,   amount_eur
+        (1, "2024-01-26", PE_SHARE_CLASS_ID, "deal_1", 1_000_000.0),
+    ]  # a partial realization -- still less than capital called, so this one
+    # event alone is pure return of capital; the fuller tier stack (pref,
+    # catch-up, carry) shows up in the mark-to-market accrual instead, see
+    # the INCENTIVE rows calculate_nav.py writes to fee_accruals.
+
+
+def gen_pe_sleeve_marks():
+    """The manager's periodic gross mark of the illiquid sleeve, pre-deal.
+    Marked roughly weekly, not daily -- real illiquid assets get a manager
+    mark, not a daily quote. calculate_nav.py carries the last mark forward
+    flat between marks, and only nudges it for that day's own calls/distributions.
+    """
+    # Each mark is the manager's PRE-DEAL gross value of the whole sleeve --
+    # it must already reflect any distribution paid out on or before that
+    # date, or the sleeve would be double-counted (marked as if the cash
+    # that already left were still sitting in it).
+    return [
+        # mark_date,    share_class_id,     sleeve_value_eur
+        ("2024-01-12", PE_SHARE_CLASS_ID, 2_150_000.0),   # up on the first 2.0m call
+        ("2024-01-19", PE_SHARE_CLASS_ID, 2_300_000.0),
+        # 2024-01-22: +1.0m call -> base rises to 3.3m, no new mark needed that day
+        ("2024-01-26", PE_SHARE_CLASS_ID, 3_450_000.0),   # pre-deal, before the 1.0m distribution that day
+        # 2024-01-26: -1.0m distribution -> base falls to ~2.45m
+        ("2024-01-29", PE_SHARE_CLASS_ID, 2_550_000.0),   # organic growth on the ~2.45m remaining
+    ]
 
 # FX: 1 unit of currency = this many EUR. EUR->EUR is always 1.0.
 FX_START = {"EUR": 1.0, "USD": 0.92, "CHF": 1.05, "DKK": 0.134, "GBP": 1.17}
@@ -188,6 +248,8 @@ def main():
     con.execute("PRAGMA foreign_keys = ON;")
     with open(SCHEMA_PATH) as f:
         con.executescript(f.read())
+    with open(HYBRID_SCHEMA_PATH) as f:
+        con.executescript(f.read())
 
     con.executemany(
         "INSERT INTO security_master VALUES (?,?,?,?,?,?,?)",
@@ -221,12 +283,20 @@ def main():
         "INSERT INTO subscriptions_redemptions VALUES (?,?,?,?,?)", gen_flows()
     )
 
+    con.executemany("INSERT INTO capital_commitments VALUES (?,?)", CAPITAL_COMMITMENTS)
+    con.executemany("INSERT INTO waterfall_config VALUES (?,?,?,?,?)", WATERFALL_CONFIG)
+    con.executemany("INSERT INTO capital_calls VALUES (?,?,?,?)", gen_pe_calls())
+    con.executemany("INSERT INTO distributions VALUES (?,?,?,?,?)", gen_pe_distributions())
+    con.executemany("INSERT INTO pe_sleeve_marks VALUES (?,?,?)", gen_pe_sleeve_marks())
+
     con.commit()
     n_prices = con.execute("SELECT COUNT(*) FROM daily_prices").fetchone()[0]
     con.close()
     print(f"Built {DB_PATH}")
     print(f"  {len(DATES)} business days ({INCEPTION} inception, {len(NAV_DATES)} NAV dates)")
     print(f"  {len(SECURITIES)} securities, {len(SHARE_CLASSES)} share classes, {n_prices} price rows")
+    print(f"  1 PE-style class ({CAPITAL_COMMITMENTS[0][1]:,.0f} EUR committed, "
+          f"{sum(c[3] for c in gen_pe_calls()):,.0f} EUR called, EUROPEAN waterfall)")
     print("  5 errors planted (see the # PLANTED ERROR comments)")
 
 
