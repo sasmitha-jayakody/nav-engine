@@ -64,3 +64,21 @@ ORDER BY n.nav_date, n.share_class_id;
 SELECT severity, check_name, subject, detail
 FROM exceptions
 ORDER BY CASE severity WHEN 'HIGH' THEN 0 WHEN 'MEDIUM' THEN 1 ELSE 2 END;
+
+-- 9. The PE sleeve, quarter by quarter  ------------------------------------
+--    Units only move when capital is called. NAV per unit drops after each
+--    distribution, which is why DPI and TVPI matter more for this book.
+SELECT nav_date,
+       ROUND(net_assets_eur, 0)                     AS net_assets_eur,
+       ROUND(units_outstanding, 1)                  AS units,
+       ROUND(nav_per_unit_eur, 2)                   AS nav_per_unit,
+       ROUND(carry_accrued_eur - carry_paid_eur, 0) AS carry_owed_eur
+FROM pe_sleeve_nav
+ORDER BY nav_date;
+
+-- 10. GROUP BY on the waterfall: how each sale was split  ------------------
+SELECT dist_date, deal_id, tier, recipient,
+       ROUND(SUM(amount_eur), 0) AS amount_eur
+FROM pe_waterfall_ledger
+GROUP BY dist_date, deal_id, tier, recipient
+ORDER BY dist_date, tier;

@@ -9,10 +9,14 @@ The sleeve is valued once a quarter. On each valuation date:
   2. charge the management fee for the quarter on that mark
   3. run the waterfall over every call and distribution so far, with what is
      left of the mark treated as sold today. The GP's total is carry accrued.
-  4. strike NAV per unit: mark, less fee, less carry accrued but not paid,
-     divided by units in issue
-  5. deal at that NAV. A call issues units. A distribution redeems the LP
-     share of the cash, and the GP share is recorded as carry paid.
+  4. work out net assets: mark, less fee, less carry accrued but not paid
+  5. deal. A call issues units at net assets per unit before the call. A
+     distribution pays out cash and leaves the units alone, so NAV per unit
+     falls. The GP's share of the cash is recorded as carry paid.
+  6. report NAV per unit after dealing, plus DPI and TVPI
+
+This is a closed-end sleeve that keeps units, so it can report a NAV per unit
+the same way the liquid fund does.
 """
 
 import os
@@ -53,6 +57,23 @@ def sleeve_cashflows(calls, dists, on_date):
     return flows
 
 
+def multiples(nav_rows, calls, dists):
+    """DPI and TVPI to each date, on called capital (paid-in).
+
+    DPI is cash LPs have had back. TVPI adds what they still hold at NAV.
+    """
+    out = []
+    for r in nav_rows:
+        d = r[0]
+        paid_in = sum(c["amount_eur"] for c in calls if c["call_date"] <= d)
+        lp_back = sum(x["lp_eur"] for x in dists if x["dist_date"] <= d)
+        if paid_in == 0:
+            out.append((0.0, 0.0))
+        else:
+            out.append((lp_back / paid_in, (lp_back + r[6]) / paid_in))
+    return out
+
+
 def strike(con, sleeve):
     sid = sleeve["sleeve_id"]
     marks = query(con, "SELECT valuation_date, gross_value_eur FROM pe_valuations "
@@ -84,12 +105,13 @@ def strike(con, sleeve):
         carry_accrued = result.gp_total()
 
         net_before = gross - fee - (carry_accrued - carry_paid)
-        nav = net_before / units if units > 0 else sleeve["launch_nav"]
+        issue_price = net_before / units if units > 0 else sleeve["launch_nav"]
 
         lp_cash, gp_cash = result.split_on(d)
-        units += call_today / nav - lp_cash / nav
+        units += call_today / issue_price
         carry_paid += gp_cash
         net_after = net_before + call_today - lp_cash
+        nav = net_after / units if units > 0 else sleeve["launch_nav"]
 
         nav_rows.append((d, sid, gross, fee, carry_accrued, carry_paid, net_after, units, nav))
         for r in result.ledger:
@@ -115,15 +137,19 @@ def run():
     con.executemany("INSERT INTO pe_waterfall_ledger (sleeve_id, dist_date, deal_id, tier, "
                     "recipient, amount_eur) VALUES (?,?,?,?,?,?)", ledger_rows)
     con.commit()
+    calls = query(con, "SELECT call_date, amount_eur FROM pe_capital_calls")
+    dists = query(con, "SELECT dist_date, SUM(amount_eur) AS lp_eur FROM pe_waterfall_ledger "
+                       "WHERE recipient = 'LP' GROUP BY dist_date")
     con.close()
 
     print(f"\nStruck PE sleeve NAV for {len(nav_rows)} quarter ends.\n")
-    hdr = (f"{'nav_date':<11}{'mark':>12}{'carry_accr':>12}{'carry_paid':>12}"
-           f"{'units':>11}{'nav/unit':>10}")
+    hdr = (f"{'nav_date':<11}{'mark':>11}{'carry_accr':>11}{'net_assets':>12}"
+           f"{'nav/unit':>9}{'dpi':>6}{'tvpi':>6}")
     print(hdr)
     print("-" * len(hdr))
-    for r in nav_rows:
-        print(f"{r[0]:<11}{r[2]:>12,.0f}{r[4]:>12,.0f}{r[5]:>12,.0f}{r[7]:>11,.1f}{r[8]:>10.2f}")
+    for r, (dpi, tvpi) in zip(nav_rows, multiples(nav_rows, calls, dists)):
+        mark = f"{r[2]:,.0f}" if r[2] else "launch"
+        print(f"{r[0]:<11}{mark:>11}{r[4]:>11,.0f}{r[6]:>12,.0f}{r[8]:>9.2f}{dpi:>6.2f}{tvpi:>6.2f}")
     return nav_rows
 
 

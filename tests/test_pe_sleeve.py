@@ -53,6 +53,14 @@ class PeSleevePipeline(unittest.TestCase):
         self.assertEqual(nav, 100.0)
         self.assertAlmostEqual(units, 20_000.0)
 
+    def test_distributions_leave_units_alone(self):
+        rows = self.con.execute(
+            "SELECT nav_date, units_outstanding FROM pe_sleeve_nav ORDER BY nav_date").fetchall()
+        dist_dates = {d for (d,) in self.con.execute("SELECT dist_date FROM pe_distributions")}
+        for (_, before), (d, after) in zip(rows, rows[1:]):
+            if d in dist_dates:
+                self.assertAlmostEqual(before, after)
+
     def test_ledger_adds_up_to_each_distribution(self):
         for dist_date, amount in self.con.execute("SELECT dist_date, amount_eur FROM pe_distributions"):
             tiered = self.con.execute(

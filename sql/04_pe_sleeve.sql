@@ -5,10 +5,11 @@
 -- 01_schema.sql. It has its own assets, its own investors and its own NAV, so
 -- it is not a share class. Share classes all own the same portfolio.
 --
--- Investors commit capital, the manager calls it as deals come up, and cash
--- comes back as distributions. The sleeve is evergreen style: capital calls
--- buy units at the NAV struck that quarter and distributions redeem them.
--- A closed-end PE fund would keep partner capital accounts instead.
+-- It is closed-end. Investors commit capital, the manager calls it as deals
+-- come up, and cash comes back as distributions. The sleeve keeps units so it
+-- can report NAV per unit: a call issues units, and a distribution pays cash
+-- without touching the units, so NAV per unit falls. Plenty of closed-end
+-- funds keep partner capital accounts instead.
 --
 -- Valuation is quarterly, from a manager mark. Carry is accrued each quarter
 -- on a hypothetical liquidation (HLBV) basis: run the waterfall as if the
@@ -74,8 +75,8 @@ CREATE TABLE pe_sleeve_nav (
     carry_accrued_eur   REAL    NOT NULL,  -- GP carry to date on an HLBV basis, paid or not
     carry_paid_eur      REAL    NOT NULL,  -- GP carry actually paid out to date
     net_assets_eur      REAL    NOT NULL,  -- after the day's calls and distributions
-    units_outstanding   REAL    NOT NULL,  -- after the day's calls and distributions
-    nav_per_unit_eur    REAL    NOT NULL,  -- struck before dealing
+    units_outstanding   REAL    NOT NULL,  -- only changes when capital is called
+    nav_per_unit_eur    REAL    NOT NULL,  -- after the day's calls and distributions
     PRIMARY KEY (nav_date, sleeve_id),
     FOREIGN KEY (sleeve_id) REFERENCES pe_sleeve(sleeve_id)
 );

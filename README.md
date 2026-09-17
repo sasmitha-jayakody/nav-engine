@@ -142,16 +142,18 @@ The sleeve is a separate book under the same umbrella as the liquid fund. It
 has its own deals and investors and strikes its own NAV, so it is not a share
 class. Share classes all own the same portfolio. The sleeve doesn't.
 
-Investors commit 5.0m EUR. The manager calls it as deals come up, three calls
-for 4.5m in total, and pays cash back when a deal is sold. The sleeve is
-evergreen style: a call buys units at that quarter's NAV and a distribution
-redeems them. A closed-end PE fund would keep partner capital accounts
-instead, which this repo doesn't model.
+It is closed-end. Investors commit 5.0m EUR, the manager calls it as deals
+come up (three calls, 4.5m in total) and pays cash back when a deal is sold.
+The sleeve keeps units so it can report a NAV per unit like the liquid fund. A
+call issues units at that quarter's NAV. A distribution pays cash out and
+leaves the units alone, so NAV per unit drops. Plenty of closed-end funds keep
+partner capital accounts instead.
 
-Valuation is quarterly, from a manager mark, running from Q1 2024 to Q2 2026.
-On each quarter end `src/pe_sleeve.py` charges the 150 bps management fee,
-accrues carry, strikes NAV per unit, and then deals that day's calls and
-distributions at that NAV.
+The liquid fund's data only covers January 2024. A waterfall needs a few years
+of calls and exits before it has anything to show, so the sleeve runs from Q1
+2024 to Q2 2026 and is valued at each quarter end from a manager mark. On each
+of those dates `src/pe_sleeve.py` charges the 150 bps management fee, accrues
+carry, and then deals that day's calls and distributions.
 
 Carry goes through the waterfall in `src/waterfall.py`:
 
@@ -165,17 +167,25 @@ Carry goes through the waterfall in `src/waterfall.py`:
 Between sales, carry is accrued on a hypothetical liquidation basis (HLBV).
 The engine runs the waterfall as if the sleeve sold everything at the mark,
 and the GP's share goes on the books as a liability. Nobody has been paid it,
-but it still comes off the NAV investors see. By the end of June 2026 the
-sleeve is at 115.77 a unit with 22k EUR of carry accrued and none paid, since
-both sales so far only returned capital.
+but it still comes off the NAV investors see. By the end of June 2026 there is
+22k EUR of carry accrued and none paid, since both sales so far only returned
+capital.
+
+After two exits NAV per unit is down to 24.43, which on its own says little
+about how the sleeve has done. The figures people look at are DPI,
+the cash LPs have had back per euro called (0.89x), and TVPI, which adds what
+they still hold at NAV (1.13x). Both are net of fees and accrued carry, and
+`run.py` prints them for every quarter.
 
 The sleeve uses a European waterfall, with one set of tiers for the whole
 sleeve. An American waterfall runs the tiers deal by deal, and on this data the
 difference is easy to see. Deal A was sold for 1.8m against 2.0m called, so it
 lost money. Deal B was sold for 2.2m against 1.5m called. Deal by deal, the GP
 would already have been paid 140k EUR of carry on deal B, loss on deal A or
-not. The European waterfall hasn't paid anything yet. The 118k gap is what a
-clawback clause exists to recover, and `waterfall.clawback()` calculates it.
+not. The European waterfall hasn't paid anything yet. If the sleeve were wound
+up at today's marks, the GP would owe 118k EUR of that back, which is the
+situation a clawback clause is written for. `waterfall.clawback()` works out
+that exposure.
 
 Left out: management fees counting as contributed capital, fee offsets against
 carry, recycling of proceeds and tax distributions. The sleeve has no cash
