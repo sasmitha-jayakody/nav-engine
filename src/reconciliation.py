@@ -257,7 +257,8 @@ def check_pe_sleeve(con):
 def run():
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA foreign_keys = ON;")
-    con.executescript(open(VALUATION_SQL).read())
+    with open(VALUATION_SQL) as f:
+        con.executescript(f.read())
 
     findings = []
     for fn in (check_stale_prices, check_missing_prices, check_price_moves,

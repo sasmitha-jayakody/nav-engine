@@ -49,8 +49,9 @@ def query(con, sql, params=()):
 
 
 def load(con):
-    con.executescript(open(VALUATION_SQL).read())  # (re)create the views
-
+    with open(VALUATION_SQL) as f:
+        con.executescript(f.read())  # (re)create the views
+        
     gav = query(con, "SELECT val_date, gross_asset_value_eur FROM v_fund_gav ORDER BY val_date")
     classes = query(con, "SELECT share_class_id, class_name, currency, mgmt_fee_bps "
                          "FROM share_classes ORDER BY share_class_id")
